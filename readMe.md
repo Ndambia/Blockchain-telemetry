@@ -411,7 +411,7 @@ RoleStrategy ROLE_STRATEGY = STRATEGY_MAC_BASED;  // Change this
 | `W`     | Write     | Manual SPIFFS save    |
 | `C`     | Clear     | Delete all storage    |
 | `L`     | List      | Show SPIFFS files     |
-| `?`     | Help      | Show command menu     |
+| `?`     | Help      | Show menu            |
 
 ### Example Usage Session
 
