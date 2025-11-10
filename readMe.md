@@ -6,6 +6,10 @@
 
 A distributed blockchain-based telemetry system for ESP32 microcontrollers with persistent storage, mesh networking, and dynamic role assignment.
 
+# UI coming soon
+
+The ui code for dash board is been cooked Cooming soon
+
 ## 📋 Table of Contents
 
 - [Overview](#overview)
