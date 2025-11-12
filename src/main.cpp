@@ -21,6 +21,7 @@
  * - Periodic saves to prevent data loss
  */
 
+ 
 #include <esp_now.h>
 #include <WiFi.h>
 #include <mbedtls/md.h>
@@ -1113,3 +1114,954 @@ void loop() {
     
     delay(100);
 }
+
+
+//Bride code
+
+/*
+ * ESP32 BLOCKCHAIN BRIDGE NODE v1.4
+ * 
+ * This node acts as a bridge between:
+ * - ESP-NOW mesh network (local blockchain)
+ * - WiFi/Internet (Flask backend + dashboard)
+ * 
+ * Features:
+ * - Full blockchain participant (can be validator/sensor/archive)
+ * - Reports telemetry to Flask backend
+ * - Forwards block/transaction data to cloud
+ * - Syncs network status with dashboard
+ * - Dual network operation (ESP-NOW + WiFi)
+ * 
+ * Hardware: ESP32 DevKit
+ * Network: ESP-NOW + WiFi Station mode
+ 
+/*
+#include <esp_now.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <mbedtls/md.h>
+#include <Preferences.h>
+#include <SPIFFS.h>
+#include <FS.h>
+#include <ArduinoJson.h>
+
+// ==================== WIFI CONFIGURATION ====================
+const char* WIFI_SSID = "Stuxs";
+const char* WIFI_PASSWORD = "Brian37744888";
+const char* BACKEND_URL = "http://192.168.0.107:5000/api";  // Update with your server IP
+
+// ==================== BRIDGE CONFIGURATION ====================
+#define BRIDGE_MODE true
+#define HTTP_REPORT_INTERVAL 5000    // Report to backend every 5 seconds
+#define HTTP_TIMEOUT 5000            // HTTP request timeout
+
+// ==================== BLOCKCHAIN CONFIGURATION ====================
+#define MAX_BLOCKS 50
+#define MAX_PEERS 10
+#define BLOCK_TIME_MS 30000
+#define MAX_TX_PER_BLOCK 4
+#define TX_POOL_SIZE 20
+#define PEER_ANNOUNCE_INTERVAL 60000
+#define SAVE_INTERVAL 60000
+
+// Storage paths
+#define BLOCKCHAIN_FILE "/blockchain.dat"
+#define TXPOOL_FILE "/txpool.dat"
+#define METADATA_FILE "/metadata.dat"
+
+// Node role
+enum NodeRole {
+    SENSOR_NODE,
+    VALIDATOR_NODE,
+    ARCHIVE_NODE
+};
+
+enum RoleStrategy {
+    STRATEGY_MAC_BASED,
+    STRATEGY_FIRST_COME,
+    STRATEGY_RUNTIME_ELECT,
+    STRATEGY_ALL_VALIDATOR
+};
+
+RoleStrategy ROLE_STRATEGY = STRATEGY_MAC_BASED;
+NodeRole MY_ROLE = SENSOR_NODE;
+
+// ==================== DATA STRUCTURES ====================
+
+typedef uint8_t Hash32[32];
+
+struct TelemetryData {
+    char sensorId[16];
+    float temperature;
+    float humidity;
+    float pressure;
+    float batteryVoltage;
+    uint32_t timestamp;
+    int16_t rssi;
+    uint8_t dataQuality;
+} __attribute__((packed));
+
+struct Transaction {
+    Hash32 txHash;
+    TelemetryData data;
+    uint8_t signature[32];
+    uint8_t verified;
+} __attribute__((packed));
+
+struct Block {
+    uint32_t index;
+    uint32_t timestamp;
+    Hash32 txHashes[MAX_TX_PER_BLOCK];
+    uint8_t txCount;
+    Hash32 previousHash;
+    Hash32 blockHash;
+    char validator[17];
+    uint32_t nonce;
+} __attribute__((packed));
+
+struct BlockHeader {
+    uint32_t index;
+    uint32_t timestamp;
+    uint8_t txCount;
+    Hash32 blockHash;
+    Hash32 previousHash;
+    char validator[17];
+} __attribute__((packed));
+
+struct ChainMetadata {
+    uint32_t blockCount;
+    uint32_t totalBlocks;
+    uint32_t lastSaveTime;
+    char lastValidator[17];
+} __attribute__((packed));
+
+enum MessageType {
+    MSG_NEW_TELEMETRY,
+    MSG_NEW_BLOCK,
+    MSG_REQUEST_CHAIN,
+    MSG_CHAIN_DATA,
+    MSG_PEER_ANNOUNCE,
+    MSG_VALIDATOR_HEARTBEAT
+};
+
+struct NetworkPacket {
+    MessageType type;
+    uint8_t data[200];
+    uint16_t dataLen;
+    char sender[17];
+} __attribute__((packed));
+
+// ==================== GLOBAL STATE ====================
+
+Block blockchain[MAX_BLOCKS];
+uint32_t blockCount = 0;
+uint32_t totalBlocks = 0;
+
+Transaction txPool[TX_POOL_SIZE];
+uint8_t txPoolCount = 0;
+
+uint8_t peerList[MAX_PEERS][6];
+uint8_t peerCount = 0;
+bool broadcastPeerAdded = false;
+
+char myAddress[17];
+Preferences preferences;
+
+unsigned long lastBlockTime = 0;
+unsigned long lastTelemetryTime = 0;
+unsigned long lastAnnounceTime = 0;
+unsigned long lastSaveTime = 0;
+unsigned long lastHttpReport = 0;
+
+bool spiffsInitialized = false;
+bool wifiConnected = false;
+bool backendRegistered = false;
+
+// ==================== FORWARD DECLARATIONS ====================
+
+void bin2hex(const uint8_t* bin, size_t len, char* outHex);
+void calculateSHA256Binary(const uint8_t* data, size_t len, uint8_t* out32);
+void calculateTxHash(Transaction* tx);
+void calculateBlockHash(Block* block);
+void signTransaction(Transaction* tx);
+
+// ==================== WIFI FUNCTIONS ====================
+
+void connectWiFi() {
+    if (wifiConnected) return;
+    
+    Serial.println("\n📶 Connecting to WiFi...");
+    Serial.printf("   SSID: %s\n", WIFI_SSID);
+    
+    WiFi.mode(WIFI_AP_STA);  // Station + AP mode for ESP-NOW compatibility
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        Serial.println("\n✓ WiFi connected");
+        Serial.printf("   IP: %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("   RSSI: %d dBm\n", WiFi.RSSI());
+    } else {
+        Serial.println("\n✗ WiFi connection failed");
+        Serial.println("   Continuing in ESP-NOW only mode");
+    }
+}
+
+void checkWiFiConnection() {
+    if (WiFi.status() != WL_CONNECTED) {
+        wifiConnected = false;
+        backendRegistered = false;
+        Serial.println("⚠️  WiFi disconnected, attempting reconnection...");
+        connectWiFi();
+    }
+}
+
+// ==================== HTTP BACKEND FUNCTIONS ====================
+
+bool registerWithBackend() {
+    if (!wifiConnected || backendRegistered) return backendRegistered;
+    
+    HTTPClient http;
+    String url = String(BACKEND_URL) + "/register";
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(HTTP_TIMEOUT);
+    
+    StaticJsonDocument<256> doc;
+    doc["mac_address"] = myAddress;
+    doc["node_id"] = myAddress;
+    
+    const char* roleStr = (MY_ROLE == SENSOR_NODE) ? "SENSOR" : 
+                          (MY_ROLE == VALIDATOR_NODE) ? "VALIDATOR" : "ARCHIVE";
+    doc["role"] = roleStr;
+    
+    String payload;
+    serializeJson(doc, payload);
+    
+    int httpCode = http.POST(payload);
+    
+    if (httpCode > 0) {
+        if (httpCode == 200) {
+            String response = http.getString();
+            Serial.println("✓ Registered with backend");
+            Serial.printf("   Response: %s\n", response.c_str());
+            backendRegistered = true;
+        } else {
+            Serial.printf("⚠️  Backend returned: %d\n", httpCode);
+        }
+    } else {
+        Serial.printf("✗ HTTP Error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    
+    http.end();
+    return backendRegistered;
+}
+
+void sendTelemetryToBackend(Transaction* tx) {
+    if (!wifiConnected || !backendRegistered) return;
+    
+    HTTPClient http;
+    String url = String(BACKEND_URL) + "/telemetry";
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(HTTP_TIMEOUT);
+    
+    StaticJsonDocument<512> doc;
+    doc["node_id"] = myAddress;
+    doc["temperature"] = tx->data.temperature;
+    doc["humidity"] = tx->data.humidity;
+    doc["pressure"] = tx->data.pressure;
+    doc["battery"] = tx->data.batteryVoltage;
+    doc["free_heap"] = ESP.getFreeHeap();
+    doc["uptime"] = millis() / 1000;
+    
+    String payload;
+    serializeJson(doc, payload);
+    
+    int httpCode = http.POST(payload);
+    
+    if (httpCode == 200) {
+        Serial.println("✓ Telemetry sent to backend");
+    } else if (httpCode > 0) {
+        Serial.printf("⚠️  Backend error: %d\n", httpCode);
+    }
+    
+    http.end();
+}
+
+void sendBlockToBackend(Block* block) {
+    if (!wifiConnected || !backendRegistered) return;
+    
+    HTTPClient http;
+    String url = String(BACKEND_URL) + "/mine";
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(HTTP_TIMEOUT);
+    
+    StaticJsonDocument<512> doc;
+    doc["node_id"] = myAddress;
+    doc["block_index"] = block->index;
+    doc["tx_count"] = block->txCount;
+    
+    String payload;
+    serializeJson(doc, payload);
+    
+    int httpCode = http.POST(payload);
+    
+    if (httpCode == 200) {
+        Serial.println("✓ Block notification sent to backend");
+    }
+    
+    http.end();
+}
+
+void sendStatusToBackend() {
+    if (!wifiConnected || !backendRegistered) return;
+    
+    HTTPClient http;
+    String url = String(BACKEND_URL) + "/status";
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(HTTP_TIMEOUT);
+    
+    StaticJsonDocument<512> doc;
+    doc["node_id"] = myAddress;
+    doc["block_count"] = blockCount;
+    doc["peer_count"] = peerCount;
+    doc["free_heap"] = ESP.getFreeHeap();
+    doc["uptime"] = millis() / 1000;
+    doc["spiffs_used"] = SPIFFS.usedBytes();
+    doc["spiffs_total"] = SPIFFS.totalBytes();
+    
+    const char* roleStr = (MY_ROLE == SENSOR_NODE) ? "SENSOR" : 
+                          (MY_ROLE == VALIDATOR_NODE) ? "VALIDATOR" : "ARCHIVE";
+    doc["role"] = roleStr;
+    
+    String payload;
+    serializeJson(doc, payload);
+    
+    int httpCode = http.POST(payload);
+    
+    if (httpCode == 200) {
+        Serial.println("✓ Status updated on backend");
+    }
+    
+    http.end();
+}
+
+void httpReportTask() {
+    unsigned long now = millis();
+    
+    if (now - lastHttpReport >= HTTP_REPORT_INTERVAL) {
+        checkWiFiConnection();
+        
+        if (wifiConnected) {
+            if (!backendRegistered) {
+                registerWithBackend();
+            } else {
+                sendStatusToBackend();
+            }
+        }
+        
+        lastHttpReport = now;
+    }
+}
+
+// ==================== SPIFFS FUNCTIONS ====================
+
+bool initSPIFFS() {
+    Serial.println("\n📁 Initializing SPIFFS...");
+    
+    if(!SPIFFS.begin(true)) {
+        Serial.println("✗ SPIFFS mount failed");
+        return false;
+    }
+    
+    size_t totalBytes = SPIFFS.totalBytes();
+    size_t usedBytes = SPIFFS.usedBytes();
+    
+    Serial.printf("✓ SPIFFS mounted\n");
+    Serial.printf("  Total: %u bytes\n", totalBytes);
+    Serial.printf("  Used: %u bytes\n", usedBytes);
+    Serial.printf("  Free: %u bytes\n", totalBytes - usedBytes);
+    
+    spiffsInitialized = true;
+    return true;
+}
+
+bool saveBlockchain() {
+    if(!spiffsInitialized) return false;
+    
+    Serial.println("💾 Saving blockchain to SPIFFS...");
+    
+    File file = SPIFFS.open(BLOCKCHAIN_FILE, FILE_WRITE);
+    if(!file) {
+        Serial.println("✗ Failed to open blockchain file");
+        return false;
+    }
+    
+    file.write((uint8_t*)&blockCount, sizeof(blockCount));
+    
+    for(uint32_t i = 0; i < blockCount && i < MAX_BLOCKS; i++) {
+        file.write((uint8_t*)&blockchain[i], sizeof(Block));
+    }
+    
+    file.close();
+    Serial.printf("✓ Saved %u blocks\n", blockCount);
+    return true;
+}
+
+bool loadBlockchain() {
+    if(!spiffsInitialized || !SPIFFS.exists(BLOCKCHAIN_FILE)) {
+        return false;
+    }
+    
+    Serial.println("📖 Loading blockchain from SPIFFS...");
+    
+    File file = SPIFFS.open(BLOCKCHAIN_FILE, FILE_READ);
+    if(!file) return false;
+    
+    uint32_t savedBlockCount;
+    file.read((uint8_t*)&savedBlockCount, sizeof(savedBlockCount));
+    
+    uint32_t blocksToLoad = (savedBlockCount < MAX_BLOCKS) ? savedBlockCount : MAX_BLOCKS;
+    
+    for(uint32_t i = 0; i < blocksToLoad; i++) {
+        file.read((uint8_t*)&blockchain[i], sizeof(Block));
+    }
+    
+    file.close();
+    
+    blockCount = blocksToLoad;
+    totalBlocks = savedBlockCount;
+    
+    Serial.printf("✓ Loaded %u blocks\n", blockCount);
+    return true;
+}
+
+// ==================== CRYPTOGRAPHIC FUNCTIONS ====================
+
+void calculateSHA256Binary(const uint8_t* data, size_t len, uint8_t* out32) {
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+    mbedtls_md_starts(&ctx);
+    mbedtls_md_update(&ctx, data, len);
+    mbedtls_md_finish(&ctx, out32);
+    mbedtls_md_free(&ctx);
+}
+
+void bin2hex(const uint8_t* bin, size_t len, char* outHex) {
+    for(size_t i = 0; i < len; ++i) {
+        sprintf(outHex + i*2, "%02x", bin[i]);
+    }
+    outHex[len*2] = '\0';
+}
+
+void calculateTxHash(Transaction* tx) {
+    char data[200];
+    int n = snprintf(data, sizeof(data), "%s|%.2f|%.2f|%.2f|%u",
+                     tx->data.sensorId,
+                     tx->data.temperature,
+                     tx->data.humidity,
+                     tx->data.pressure,
+                     tx->data.timestamp);
+    calculateSHA256Binary((const uint8_t*)data, n, tx->txHash);
+}
+
+void calculateBlockHash(Block* block) {
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+    mbedtls_md_starts(&ctx);
+
+    uint8_t buf[64];
+    int len = snprintf((char*)buf, sizeof(buf), "%u|%u|", block->index, block->timestamp);
+    mbedtls_md_update(&ctx, buf, len);
+    mbedtls_md_update(&ctx, (const unsigned char*)block->validator, strlen(block->validator));
+    mbedtls_md_update(&ctx, (const unsigned char*)&block->nonce, sizeof(block->nonce));
+    mbedtls_md_update(&ctx, block->previousHash, 32);
+
+    for(int i = 0; i < block->txCount; ++i) {
+        mbedtls_md_update(&ctx, block->txHashes[i], 32);
+    }
+
+    mbedtls_md_finish(&ctx, block->blockHash);
+    mbedtls_md_free(&ctx);
+}
+
+void signTransaction(Transaction* tx) {
+    char data[100];
+    char hashHex[65];
+    bin2hex(tx->txHash, 32, hashHex);
+    snprintf(data, sizeof(data), "%s|%s", hashHex, myAddress);
+    calculateSHA256Binary((uint8_t*)data, strlen(data), tx->signature);
+}
+
+// ==================== BLOCKCHAIN FUNCTIONS ====================
+
+void createGenesisBlock() {
+    Block genesis = {0};
+    genesis.index = 0;
+    genesis.timestamp = millis() / 1000;
+    genesis.txCount = 0;
+    memset(genesis.previousHash, 0, 32);
+    strcpy(genesis.validator, myAddress);
+    genesis.nonce = 0;
+    
+    calculateBlockHash(&genesis);
+    
+    blockchain[0] = genesis;
+    blockCount = 1;
+    totalBlocks = 1;
+    
+    Serial.println("✓ Genesis block created");
+    saveBlockchain();
+}
+
+bool validateBlock(Block* block) {
+    if(block->index != totalBlocks) return false;
+    
+    if(blockCount > 0) {
+        Block* lastBlock = &blockchain[(blockCount - 1) % MAX_BLOCKS];
+        if (memcmp(block->previousHash, lastBlock->blockHash, 32) != 0) {
+            return false;
+        }
+    }
+    
+    Block tempBlock = *block;
+    calculateBlockHash(&tempBlock);
+    
+    if (memcmp(tempBlock.blockHash, block->blockHash, 32) != 0) {
+        return false;
+    }
+    
+    return true;
+}
+
+bool addBlock(Block* newBlock) {
+    if(!validateBlock(newBlock)) {
+        return false;
+    }
+    
+    uint32_t index = blockCount % MAX_BLOCKS;
+    blockchain[index] = *newBlock;
+    blockCount++;
+    totalBlocks++;
+    
+    txPoolCount = 0;
+    
+    Serial.printf("✓ Block #%u added (%d tx)\n", newBlock->index, newBlock->txCount);
+    
+    saveBlockchain();
+    
+    // Report to backend
+    if (BRIDGE_MODE) {
+        sendBlockToBackend(newBlock);
+    }
+    
+    return true;
+}
+
+Block createBlock() {
+    Block newBlock = {0};
+    newBlock.index = totalBlocks;
+    newBlock.timestamp = millis() / 1000;
+    
+    newBlock.txCount = (txPoolCount < MAX_TX_PER_BLOCK) ? txPoolCount : MAX_TX_PER_BLOCK;
+
+    for (int i = 0; i < newBlock.txCount; ++i) {
+        memcpy(newBlock.txHashes[i], txPool[i].txHash, 32);
+    }
+
+    if(blockCount > 0) {
+        Block* prevBlock = &blockchain[(blockCount - 1) % MAX_BLOCKS];
+        memcpy(newBlock.previousHash, prevBlock->blockHash, 32);
+    } else {
+        memset(newBlock.previousHash, 0, 32);
+    }
+    
+    strcpy(newBlock.validator, myAddress);
+    newBlock.nonce = random(0, 1000000);
+    
+    calculateBlockHash(&newBlock);
+    
+    return newBlock;
+}
+
+// ==================== TELEMETRY FUNCTIONS ====================
+
+Transaction createTelemetryTransaction() {
+    Transaction tx = {0};
+    
+    snprintf(tx.data.sensorId, sizeof(tx.data.sensorId), "ESP_%s", myAddress + 9);
+    tx.data.temperature = 20.0 + random(-50, 150) / 10.0;
+    tx.data.humidity = 40.0 + random(0, 400) / 10.0;
+    tx.data.pressure = 1013.25 + random(-100, 100) / 10.0;
+    tx.data.batteryVoltage = 3.3 + random(-3, 3) / 10.0;
+    tx.data.timestamp = millis() / 1000;
+    tx.data.rssi = WiFi.RSSI();
+    tx.data.dataQuality = 95 + random(0, 5);
+    
+    calculateTxHash(&tx);
+    signTransaction(&tx);
+    tx.verified = false;
+    
+    return tx;
+}
+
+bool addToTxPool(Transaction* tx) {
+    if(txPoolCount >= TX_POOL_SIZE) {
+        Serial.println("✗ Transaction pool full");
+        return false;
+    }
+    
+    txPool[txPoolCount++] = *tx;
+    
+    Serial.printf("✓ TX added to pool: %s (%.1f°C)\n", 
+                 tx->data.sensorId, tx->data.temperature);
+    
+    // Report to backend if bridge mode
+    if (BRIDGE_MODE && strcmp(tx->data.sensorId + 4, myAddress + 9) == 0) {
+        sendTelemetryToBackend(tx);
+    }
+    
+    return true;
+}
+
+// ==================== ROLE ASSIGNMENT ====================
+
+NodeRole assignRoleByMAC(const char* macAddr) {
+    uint32_t hash = 0;
+    for(int i = 0; macAddr[i] != '\0'; i++) {
+        hash = hash * 31 + macAddr[i];
+    }
+    
+    uint8_t roleValue = hash % 100;
+    
+    if(roleValue < 30) {
+        return VALIDATOR_NODE;
+    } else if(roleValue < 95) {
+        return SENSOR_NODE;
+    } else {
+        return ARCHIVE_NODE;
+    }
+}
+
+void assignNodeRole() {
+    MY_ROLE = assignRoleByMAC(myAddress);
+    
+    const char* roleName = 
+        MY_ROLE == SENSOR_NODE ? "SENSOR" : 
+        MY_ROLE == VALIDATOR_NODE ? "VALIDATOR" : "ARCHIVE";
+    Serial.printf("✓ Role assigned: %s\n", roleName);
+}
+
+// ==================== NETWORK FUNCTIONS ====================
+
+void setupBroadcastPeer() {
+    if(broadcastPeerAdded) return;
+    
+    uint8_t broadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, broadcastAddr, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    
+    esp_err_t result = esp_now_add_peer(&peerInfo);
+    if(result == ESP_OK) {
+        broadcastPeerAdded = true;
+        Serial.println("✓ Broadcast peer added");
+    }
+}
+
+void onDataReceived(const uint8_t* mac, const uint8_t* data, int len) {
+    NetworkPacket* packet = (NetworkPacket*)data;
+    
+    bool peerExists = false;
+    for(int i = 0; i < peerCount; i++) {
+        if(memcmp(peerList[i], mac, 6) == 0) {
+            peerExists = true;
+            break;
+        }
+    }
+    if(!peerExists && peerCount < MAX_PEERS) {
+        memcpy(peerList[peerCount++], mac, 6);
+        Serial.printf("✓ New peer added: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+    
+    switch(packet->type) {
+        case MSG_NEW_TELEMETRY: {
+            Transaction* tx = (Transaction*)packet->data;
+            addToTxPool(tx);
+            break;
+        }
+        
+        case MSG_NEW_BLOCK: {
+            BlockHeader* header = (BlockHeader*)packet->data;
+            Serial.printf("✓ Block header received: #%u\n", header->index);
+            break;
+        }
+        
+        case MSG_PEER_ANNOUNCE: {
+            Serial.printf("Peer announced: %s\n", packet->sender);
+            break;
+        }
+    }
+}
+
+void broadcastPacket(NetworkPacket* packet) {
+    strcpy(packet->sender, myAddress);
+    setupBroadcastPeer();
+    
+    uint8_t broadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    esp_now_send(broadcastAddr, (uint8_t*)packet, sizeof(NetworkPacket));
+}
+
+void broadcastTelemetry(Transaction* tx) {
+    NetworkPacket packet;
+    packet.type = MSG_NEW_TELEMETRY;
+    memcpy(packet.data, tx, sizeof(Transaction));
+    packet.dataLen = sizeof(Transaction);
+    
+    broadcastPacket(&packet);
+}
+
+void broadcastBlock(Block* block) {
+    NetworkPacket packet;
+    packet.type = MSG_NEW_BLOCK;
+    
+    BlockHeader header;
+    header.index = block->index;
+    header.timestamp = block->timestamp;
+    header.txCount = block->txCount;
+    memcpy(header.blockHash, block->blockHash, 32);
+    memcpy(header.previousHash, block->previousHash, 32);
+    strcpy(header.validator, block->validator);
+    
+    memcpy(packet.data, &header, sizeof(BlockHeader));
+    packet.dataLen = sizeof(BlockHeader);
+    
+    broadcastPacket(&packet);
+}
+
+// ==================== CONSENSUS ====================
+
+bool isMyTurnToValidate() {
+    if(peerCount == 0) return true;
+    
+    unsigned long interval = BLOCK_TIME_MS / 1000;
+    unsigned long currentSlot = (millis() / 1000) / interval;
+    
+    int myId = myAddress[15] % (peerCount + 1);
+    int validatorSlot = currentSlot % (peerCount + 1);
+    
+    return (myId == validatorSlot);
+}
+
+void validatorTask() {
+    if(MY_ROLE != VALIDATOR_NODE) return;
+    
+    unsigned long now = millis();
+    bool shouldMine = false;
+    
+    if(txPoolCount >= (TX_POOL_SIZE - 4)) {
+        shouldMine = true;
+    }
+    else if(now - lastBlockTime >= BLOCK_TIME_MS) {
+        if(txPoolCount > 0 && isMyTurnToValidate()) {
+            shouldMine = true;
+        }
+    }
+    
+    if(shouldMine && txPoolCount > 0) {
+        Serial.printf("\n⛏️  Mining new block (%d txs pending)\n", txPoolCount);
+        
+        Block newBlock = createBlock();
+        
+        if(addBlock(&newBlock)) {
+            broadcastBlock(&newBlock);
+            lastBlockTime = now;
+            
+            Serial.printf("✓ Block #%u mined and broadcast\n", newBlock.index);
+        }
+    }
+}
+
+// ==================== SENSOR TASK ====================
+
+void sensorTask() {
+    if(MY_ROLE != SENSOR_NODE && MY_ROLE != VALIDATOR_NODE) return;
+    
+    unsigned long now = millis();
+    
+    if(now - lastTelemetryTime >= 10000) {
+        Transaction tx = createTelemetryTransaction();
+        
+        addToTxPool(&tx);
+        broadcastTelemetry(&tx);
+        
+        lastTelemetryTime = now;
+    }
+}
+
+// ==================== PEER DISCOVERY ====================
+
+void peerDiscoveryTask() {
+    unsigned long now = millis();
+    
+    if(now - lastAnnounceTime >= PEER_ANNOUNCE_INTERVAL) {
+        NetworkPacket announce;
+        announce.type = MSG_PEER_ANNOUNCE;
+        strcpy(announce.sender, myAddress);
+        announce.dataLen = 0;
+        
+        setupBroadcastPeer();
+        
+        uint8_t broadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        esp_now_send(broadcastAddr, (uint8_t*)&announce, sizeof(announce));
+        
+        lastAnnounceTime = now;
+    }
+}
+
+// ==================== STATUS DISPLAY ====================
+
+void printStatus() {
+    Serial.println("\n╔════════════════════════════════════╗");
+    Serial.println("║   BRIDGE NODE STATUS               ║");
+    Serial.println("╚════════════════════════════════════╝");
+    Serial.printf(" Address: %s\n", myAddress);
+    Serial.printf(" Role: %s\n", 
+                 MY_ROLE == SENSOR_NODE ? "SENSOR" : 
+                 MY_ROLE == VALIDATOR_NODE ? "VALIDATOR" : "ARCHIVE");
+    Serial.printf(" Mode: BRIDGE (WiFi + ESP-NOW)\n");
+    Serial.printf(" WiFi: %s", wifiConnected ? "Connected" : "Disconnected");
+    if (wifiConnected) {
+        Serial.printf(" (%s)\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println();
+    }
+    Serial.printf(" Backend: %s\n", backendRegistered ? "Registered" : "Not Registered");
+    Serial.printf(" Blocks: %u (total: %u)\n", blockCount, totalBlocks);
+    Serial.printf(" TX Pool: %u / %d\n", txPoolCount, TX_POOL_SIZE);
+    Serial.printf(" Peers: %u connected\n", peerCount);
+    Serial.printf(" Uptime: %lu seconds\n", millis() / 1000);
+    Serial.printf(" Free heap: %u bytes\n", ESP.getFreeHeap());
+    Serial.println();
+}
+
+// ==================== SETUP ====================
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    
+    Serial.println("\n╔════════════════════════════════════╗");
+    Serial.println("║  ESP32 BRIDGE NODE v1.4            ║");
+    Serial.println("║  WiFi + ESP-NOW + Blockchain       ║");
+    Serial.println("╚════════════════════════════════════╝\n");
+    
+    // Initialize SPIFFS
+    if(!initSPIFFS()) {
+        Serial.println("⚠️  Continuing without SPIFFS");
+    }
+    
+    // Get MAC address
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(myAddress, sizeof(myAddress), 
+             "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    
+    Serial.printf("Node Address: %s\n", myAddress);
+    
+    // Connect to WiFi first
+    connectWiFi();
+    
+    // Initialize ESP-NOW (works alongside WiFi in AP_STA mode)
+    if(esp_now_init() != ESP_OK) {
+        Serial.println("✗ ESP-NOW init failed");
+        return;
+    }
+    
+    esp_now_register_recv_cb(onDataReceived);
+    Serial.println("✓ ESP-NOW initialized");
+    
+    // Assign role
+    assignNodeRole();
+    
+    // Try to load existing blockchain
+    bool loaded = false;
+    if(spiffsInitialized) {
+        loaded = loadBlockchain();
+    }
+    
+    // Create genesis if needed
+    if(!loaded || blockCount == 0) {
+        createGenesisBlock();
+    }
+    
+    // Setup broadcast peer
+    setupBroadcastPeer();
+    
+    // Register with backend
+    if (wifiConnected) {
+        registerWithBackend();
+    }
+    
+    // Initial peer announcement
+    NetworkPacket announce;
+    announce.type = MSG_PEER_ANNOUNCE;
+    strcpy(announce.sender, myAddress);
+    announce.dataLen = 0;
+    
+    uint8_t broadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    esp_now_send(broadcastAddr, (uint8_t*)&announce, sizeof(announce));
+    
+    Serial.println("✓ Bridge node initialized");
+    Serial.println("\n📡 Listening on ESP-NOW mesh network");
+    Serial.println("🌐 Connected to Internet via WiFi");
+    Serial.println("🔗 Bridging local blockchain to cloud backend\n");
+    
+    lastBlockTime = millis();
+    lastTelemetryTime = millis();
+    lastAnnounceTime = millis();
+    lastSaveTime = millis();
+    lastHttpReport = millis();
+}
+
+// ==================== MAIN LOOP ====================
+
+void loop() {
+    static unsigned long lastStatus = 0;
+    
+    // Run blockchain tasks
+    sensorTask();
+    validatorTask();
+    peerDiscoveryTask();
+    
+    // Run bridge tasks (WiFi/HTTP reporting)
+    httpReportTask();
+    
+    // Print status every 30 seconds
+    if(millis() - lastStatus >= 30000) {
+        printStatus();
+        lastStatus = millis();
+    }
+    
+    delay(100);
+}
+    */
