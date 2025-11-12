@@ -6,32 +6,7 @@
 
 A distributed blockchain-based telemetry system for ESP32 microcontrollers with persistent storage, mesh networking, and dynamic role assignment.
 
-# System Architecture
 
-┌─────────────────────────────────────────────────────────────┐
-│                    CLOUD BACKEND                                                                    │
-│  Flask API + Pusher (Real-time)                                                                 │
-│  URL: http://your-server:5000/api                                                              │
-└──────────────────────┬──────────────────────────────────────┘
-│ HTTP/REST
-│
-┌──────────────────────▼──────────────────────────────────────┐
-│              BRIDGE NODE (ESP32 with WiFi)                                                   │
-│  - WiFi: Connects to backend                                                                      │
-│  - ESP-NOW: Participates in mesh network                                                 │
-│  - Role: VALIDATOR/SENSOR/ARCHIVE                                                        │
-│  - Forwards blockchain data to cloud                                                         │
-└──────────────────────┬──────────────────────────────────────┘
-│ ESP-NOW Mesh
-┌─────────────┼─────────────┐
-│             │             │
-┌────────▼────┐      ┌────▼─────┐   ┌───▼──────┐
-│  ESP32 #2   │           │ ESP32 #3  │    │ ESP32 #4 │
-│  ESP-NOW    │          │ESP-NOW    │      │ ESP-NOW  │
-│  SENSOR     │           │SENSOR      │      │ VALIDATOR│
-└─────────────┘      └──────────┘   └──────────┘
-
-# ESP32 Blockchain System Setup Guide
 
 ## System Architecture
 
@@ -61,64 +36,10 @@ A distributed blockchain-based telemetry system for ESP32 microcontrollers with 
 ```
 
 
-# ESP32 Blockchain System Setup Guide
-
-## System Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    CLOUD BACKEND                            │
-│  Flask API + Pusher (Real-time)                             │
-│  URL: http://your-server:5000/api                           │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ HTTP/REST
-                       │
-┌──────────────────────▼──────────────────────────────────────┐
-│              BRIDGE NODE (ESP32 with WiFi)                  │
-│  - WiFi: Connects to backend                                │
-│  - ESP-NOW: Participates in mesh network                    │
-│  - Role: VALIDATOR/SENSOR/ARCHIVE                           │
-│  - Forwards blockchain data to cloud                        │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ ESP-NOW Mesh
-         ┌─────────────┼─────────────┐
-         │             │             │
-┌────────▼────┐  ┌────▼─────┐  ┌───▼──────┐
-│  ESP32 #2   │  │ ESP32 #3 │  │ ESP32 #4 │
-│  ESP-NOW    │  │ ESP-NOW  │  │ ESP-NOW  │
-│  SENSOR     │  │ SENSOR   │  │ VALIDATOR│
-└─────────────┘  └──────────┘  └──────────┘
-```
 
 
 # ESP32 Blockchain System Setup Guide
 
-## System Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    CLOUD BACKEND                            │
-│  Flask API + Pusher (Real-time)                             │
-│  URL: http://your-server:5000/api                           │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ HTTP/REST
-                       │
-┌──────────────────────▼──────────────────────────────────────┐
-│              BRIDGE NODE (ESP32 with WiFi)                  │
-│  - WiFi: Connects to backend                                │
-│  - ESP-NOW: Participates in mesh network                    │
-│  - Role: VALIDATOR/SENSOR/ARCHIVE                           │
-│  - Forwards blockchain data to cloud                        │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ ESP-NOW Mesh
-         ┌─────────────┼─────────────┐
-         │             │             │
-┌────────▼────┐  ┌────▼─────┐  ┌───▼──────┐
-│  ESP32 #2   │  │ ESP32 #3 │  │ ESP32 #4 │
-│  ESP-NOW    │  │ ESP-NOW  │  │ ESP-NOW  │
-│  SENSOR     │  │ SENSOR   │  │ VALIDATOR│
-└─────────────┘  └──────────┘  └──────────┘
-```
 
 
 # UI coming soon
